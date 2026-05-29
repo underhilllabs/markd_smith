@@ -48,9 +48,28 @@ use webkit6::prelude::WebViewExt;
 // collects those events and writes HTML into a String.
 use pulldown_cmark::{html, Options, Parser};
 
-use std::rc::Rc;
-use std::cell::RefCell;
 use gtk4::gio;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::rc::Rc;
+
+const DEFAULT_SHORTCUTS: &[(&str, &str)] = &[
+    ("win.open", "<Control>o"),
+    ("win.save", "<Control>s"),
+    ("win.undo", "<Control>z"),
+    ("win.redo", "<Control><Shift>z"),
+    ("win.editor-only", "<Control>1"),
+    ("win.preview-only", "<Control>2"),
+    ("win.split-view", "<Control>0"),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneMode {
+    Split,
+    EditorOnly,
+    PreviewOnly,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARKDOWN → HTML CONVERSION
@@ -129,6 +148,172 @@ fn markdown_to_html(markdown: &str) -> String {
 </body>
 </html>"#
     )
+}
+
+fn shortcut_config_path() -> Option<PathBuf> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config_home).join("markdown_smith/shortcuts.conf"));
+    }
+
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/markdown_smith/shortcuts.conf"))
+}
+
+fn default_shortcut_config() -> String {
+    let mut config = String::from("# GTK accelerator syntax\n");
+    for (action, accel) in DEFAULT_SHORTCUTS {
+        config.push_str(action);
+        config.push('=');
+        config.push_str(accel);
+        config.push('\n');
+    }
+    config
+}
+
+fn is_valid_accelerator(accel: &str) -> bool {
+    match gtk4::accelerator_parse(accel) {
+        Some((key, modifiers)) => gtk4::accelerator_valid(key, modifiers),
+        None => false,
+    }
+}
+
+fn parse_shortcut_config_with_validator(
+    contents: &str,
+    known_actions: &HashSet<&'static str>,
+    is_valid: impl Fn(&str) -> bool,
+) -> HashMap<&'static str, String> {
+    let mut shortcuts = HashMap::new();
+
+    for (line_number, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((action, accel)) = line.split_once('=') else {
+            eprintln!(
+                "Ignoring shortcut config line {}: expected action=accelerator",
+                line_number + 1
+            );
+            continue;
+        };
+
+        let action = action.trim();
+        let accel = accel.trim();
+        let Some(&known_action) = known_actions.get(action) else {
+            eprintln!(
+                "Ignoring shortcut config line {}: unknown action `{action}`",
+                line_number + 1
+            );
+            continue;
+        };
+
+        if !is_valid(accel) {
+            eprintln!(
+                "Ignoring shortcut config line {}: invalid accelerator `{accel}`",
+                line_number + 1
+            );
+            continue;
+        }
+
+        shortcuts.insert(known_action, accel.to_string());
+    }
+
+    shortcuts
+}
+
+fn parse_shortcut_config(
+    contents: &str,
+    known_actions: &HashSet<&'static str>,
+) -> HashMap<&'static str, String> {
+    parse_shortcut_config_with_validator(contents, known_actions, is_valid_accelerator)
+}
+
+fn load_shortcuts() -> HashMap<&'static str, String> {
+    let mut shortcuts = DEFAULT_SHORTCUTS
+        .iter()
+        .map(|(action, accel)| (*action, (*accel).to_string()))
+        .collect::<HashMap<_, _>>();
+
+    let Some(path) = shortcut_config_path() else {
+        return shortcuts;
+    };
+
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!("Could not create shortcut config directory: {err}");
+                return shortcuts;
+            }
+        }
+
+        if let Err(err) = std::fs::write(&path, default_shortcut_config()) {
+            eprintln!("Could not write default shortcut config: {err}");
+        }
+        return shortcuts;
+    }
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let known_actions = DEFAULT_SHORTCUTS
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<HashSet<_>>();
+            shortcuts.extend(parse_shortcut_config(&contents, &known_actions));
+        }
+        Err(err) => eprintln!("Could not read shortcut config: {err}"),
+    }
+
+    shortcuts
+}
+
+fn apply_configured_shortcuts(app: &Application) {
+    let shortcuts = load_shortcuts();
+
+    for (action, _) in DEFAULT_SHORTCUTS {
+        if let Some(accel) = shortcuts.get(action) {
+            app.set_accels_for_action(action, &[accel.as_str()]);
+        }
+    }
+}
+
+fn set_pane_mode(
+    requested_mode: PaneMode,
+    pane_mode: &Rc<RefCell<PaneMode>>,
+    last_split_position: &Rc<RefCell<i32>>,
+    paned: &gtk4::Paned,
+    editor_scroll: &ScrolledWindow,
+    web_view: &WebView,
+) {
+    let current_mode = *pane_mode.borrow();
+    let next_mode = if requested_mode == current_mode {
+        PaneMode::Split
+    } else {
+        requested_mode
+    };
+
+    if current_mode == PaneMode::Split && next_mode != PaneMode::Split {
+        *last_split_position.borrow_mut() = paned.position();
+    }
+
+    match next_mode {
+        PaneMode::Split => {
+            editor_scroll.set_visible(true);
+            web_view.set_visible(true);
+            paned.set_position(*last_split_position.borrow());
+        }
+        PaneMode::EditorOnly => {
+            editor_scroll.set_visible(true);
+            web_view.set_visible(false);
+        }
+        PaneMode::PreviewOnly => {
+            editor_scroll.set_visible(false);
+            web_view.set_visible(true);
+        }
+    }
+
+    *pane_mode.borrow_mut() = next_mode;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -210,14 +395,13 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     web_view.set_vexpand(true);
     web_view.set_hexpand(true);
 
-
     // ── Horizontal split (Paned) ────────────────────────────────────────────
 
     // LEARN: gtk4::Paned is a two-child container with a draggable divider.
     // Orientation::Horizontal places children side by side (left | right).
     let paned = gtk4::Paned::new(Orientation::Horizontal);
     paned.set_start_child(Some(&editor_scroll)); // left
-    paned.set_end_child(Some(&web_view));         // right
+    paned.set_end_child(Some(&web_view)); // right
 
     // set_wide_handle makes the drag handle easier to grab — good UX.
     paned.set_wide_handle(true);
@@ -252,6 +436,12 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     edit_menu.append(Some("Redo"), Some("win.redo"));
     menu_model.append_submenu(Some("Edit"), &edit_menu);
 
+    let view_menu = gio::Menu::new();
+    view_menu.append(Some("Editor Only"), Some("win.editor-only"));
+    view_menu.append(Some("Preview Only"), Some("win.preview-only"));
+    view_menu.append(Some("Split View"), Some("win.split-view"));
+    menu_model.append_submenu(Some("View"), &view_menu);
+
     let menu_bar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
     toolbar_view.add_top_bar(&menu_bar);
 
@@ -283,9 +473,11 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     // instead of gtk4's set_child(). Pass the ToolbarView as the sole content.
     window.set_content(Some(&toolbar_view));
 
-    // ── Shared state: path of the currently open file ───────────────────────
+    // ── Shared state ────────────────────────────────────────────────────────
     let current_file: Rc<RefCell<Option<String>>> =
         Rc::new(RefCell::new(file_path.map(str::to_owned)));
+    let pane_mode = Rc::new(RefCell::new(PaneMode::Split));
+    let last_split_position = Rc::new(RefCell::new(paned.position()));
 
     // ── Action: File → Open ─────────────────────────────────────────────────
     let open_action = gio::SimpleAction::new("open", None);
@@ -312,8 +504,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("unknown");
                                 win_cb.set_title(Some(&format!("markdown_smith — {name}")));
-                                *cf.borrow_mut() =
-                                    Some(path.to_string_lossy().into_owned());
+                                *cf.borrow_mut() = Some(path.to_string_lossy().into_owned());
                             }
                             Err(e) => eprintln!("Open error: {e}"),
                         }
@@ -323,7 +514,6 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         });
     }
     window.add_action(&open_action);
-    app.set_accels_for_action("win.open", &["<Control>o"]);
 
     // ── Action: File → Save ─────────────────────────────────────────────────
     let save_action = gio::SimpleAction::new("save", None);
@@ -371,7 +561,6 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         });
     }
     window.add_action(&save_action);
-    app.set_accels_for_action("win.save", &["<Control>s"]);
 
     // ── Action: Edit → Undo ─────────────────────────────────────────────────
     let undo_action = gio::SimpleAction::new("undo", None);
@@ -384,7 +573,6 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         });
     }
     window.add_action(&undo_action);
-    app.set_accels_for_action("win.undo", &["<Control>z"]);
 
     // ── Action: Edit → Redo ─────────────────────────────────────────────────
     let redo_action = gio::SimpleAction::new("redo", None);
@@ -397,7 +585,69 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         });
     }
     window.add_action(&redo_action);
-    app.set_accels_for_action("win.redo", &["<Control><Shift>z"]);
+
+    // ── Actions: View → pane modes ──────────────────────────────────────────
+    let editor_only_action = gio::SimpleAction::new("editor-only", None);
+    {
+        let mode = pane_mode.clone();
+        let last_position = last_split_position.clone();
+        let paned = paned.clone();
+        let editor = editor_scroll.clone();
+        let preview = web_view.clone();
+        editor_only_action.connect_activate(move |_, _| {
+            set_pane_mode(
+                PaneMode::EditorOnly,
+                &mode,
+                &last_position,
+                &paned,
+                &editor,
+                &preview,
+            );
+        });
+    }
+    window.add_action(&editor_only_action);
+
+    let preview_only_action = gio::SimpleAction::new("preview-only", None);
+    {
+        let mode = pane_mode.clone();
+        let last_position = last_split_position.clone();
+        let paned = paned.clone();
+        let editor = editor_scroll.clone();
+        let preview = web_view.clone();
+        preview_only_action.connect_activate(move |_, _| {
+            set_pane_mode(
+                PaneMode::PreviewOnly,
+                &mode,
+                &last_position,
+                &paned,
+                &editor,
+                &preview,
+            );
+        });
+    }
+    window.add_action(&preview_only_action);
+
+    let split_view_action = gio::SimpleAction::new("split-view", None);
+    {
+        let mode = pane_mode.clone();
+        let last_position = last_split_position.clone();
+        let paned = paned.clone();
+        let editor = editor_scroll.clone();
+        let preview = web_view.clone();
+        split_view_action.connect_activate(move |_, _| {
+            set_pane_mode(
+                PaneMode::Split,
+                &mode,
+                &last_position,
+                &paned,
+                &editor,
+                &preview,
+            );
+        });
+    }
+    window.add_action(&split_view_action);
+
+    apply_configured_shortcuts(app);
 
     // ── Signal: buffer changed → re-render preview ──────────────────────────
 
@@ -454,6 +704,65 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     window.present();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known_actions() -> HashSet<&'static str> {
+        DEFAULT_SHORTCUTS
+            .iter()
+            .map(|(action, _)| *action)
+            .collect::<HashSet<_>>()
+    }
+
+    fn parse_for_test(contents: &str) -> HashMap<&'static str, String> {
+        parse_shortcut_config_with_validator(contents, &known_actions(), |accel| {
+            accel.starts_with('<')
+        })
+    }
+
+    #[test]
+    fn parses_valid_shortcut_lines() {
+        let shortcuts = parse_for_test("win.editor-only=<Control>e\nwin.preview-only=<Control>p\n");
+
+        assert_eq!(
+            shortcuts.get("win.editor-only"),
+            Some(&"<Control>e".to_string())
+        );
+        assert_eq!(
+            shortcuts.get("win.preview-only"),
+            Some(&"<Control>p".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_comments_and_blank_lines() {
+        let shortcuts = parse_for_test("\n# comment\n  \nwin.split-view=<Control>0\n");
+
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(
+            shortcuts.get("win.split-view"),
+            Some(&"<Control>0".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_unknown_actions() {
+        let shortcuts = parse_for_test("win.unknown=<Control>u\nwin.open=<Control>o\n");
+
+        assert!(!shortcuts.contains_key("win.unknown"));
+        assert_eq!(shortcuts.get("win.open"), Some(&"<Control>o".to_string()));
+    }
+
+    #[test]
+    fn rejects_invalid_accelerators() {
+        let shortcuts = parse_for_test("win.open=not a shortcut\nwin.save=<Control>s\n");
+
+        assert!(!shortcuts.contains_key("win.open"));
+        assert_eq!(shortcuts.get("win.save"), Some(&"<Control>s".to_string()));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ENTRY POINT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -471,9 +780,7 @@ fn main() {
     // Read the optional file path from the first non-flag argument.
     // We do this before app.run() because GTK strips its own flags
     // (--display, --class, etc.) during run() and we'd lose our argument.
-    let file_path: Option<String> = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-'));
+    let file_path: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
 
     let app = Application::new(
         Some("com.example.markdown-smith"),
