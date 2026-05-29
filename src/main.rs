@@ -57,6 +57,7 @@ use std::rc::Rc;
 const DEFAULT_SHORTCUTS: &[(&str, &str)] = &[
     ("win.open", "<Control>o"),
     ("win.save", "<Control>s"),
+    ("win.quit", "<Control>q"),
     ("win.undo", "<Control>z"),
     ("win.redo", "<Control><Shift>z"),
     ("win.editor-only", "<Control>1"),
@@ -278,6 +279,100 @@ fn apply_configured_shortcuts(app: &Application) {
     }
 }
 
+fn write_buffer_to_path(
+    buffer: &Buffer,
+    window: &adw::ApplicationWindow,
+    current_file: &Rc<RefCell<Option<String>>>,
+    path: PathBuf,
+) -> bool {
+    let (start, end) = buffer.bounds();
+    let text = buffer.text(&start, &end, false);
+
+    if let Err(err) = std::fs::write(&path, text.as_str()) {
+        eprintln!("Save error: {err}");
+        return false;
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    window.set_title(Some(&format!("markdown_smith — {name}")));
+    *current_file.borrow_mut() = Some(path.to_string_lossy().into_owned());
+    buffer.set_modified(false);
+    true
+}
+
+fn save_buffer_or_prompt_for_path(
+    buffer: Buffer,
+    window: adw::ApplicationWindow,
+    current_file: Rc<RefCell<Option<String>>>,
+    after_save: impl FnOnce() + 'static,
+) {
+    if let Some(path) = current_file.borrow().clone() {
+        if write_buffer_to_path(&buffer, &window, &current_file, PathBuf::from(path)) {
+            after_save();
+        }
+        return;
+    }
+
+    let dialog = gtk4::FileDialog::new();
+    let parent = window.clone();
+    dialog.save(Some(&parent), gio::Cancellable::NONE, move |result| {
+        if let Ok(file) = result {
+            if let Some(path) = file.path() {
+                if write_buffer_to_path(&buffer, &window, &current_file, path) {
+                    after_save();
+                }
+            }
+        }
+    });
+}
+
+fn request_quit(
+    buffer: Buffer,
+    window: adw::ApplicationWindow,
+    current_file: Rc<RefCell<Option<String>>>,
+    allow_close: Rc<RefCell<bool>>,
+) {
+    if !buffer.is_modified() {
+        *allow_close.borrow_mut() = true;
+        window.close();
+        return;
+    }
+
+    let dialog = gtk4::AlertDialog::builder()
+        .modal(true)
+        .message("Save changes before quitting?")
+        .detail("The current document has unsaved changes.")
+        .buttons(["Cancel", "Discard", "Save"])
+        .cancel_button(0)
+        .default_button(2)
+        .build();
+
+    let parent = window.clone();
+    dialog.choose(
+        Some(&parent),
+        gio::Cancellable::NONE,
+        move |result| match result {
+            Ok(2) => {
+                let win = window.clone();
+                let close_flag = allow_close.clone();
+                save_buffer_or_prompt_for_path(buffer, window, current_file, move || {
+                    *close_flag.borrow_mut() = true;
+                    win.close();
+                });
+            }
+            Ok(1) => {
+                *allow_close.borrow_mut() = true;
+                window.close();
+            }
+            Ok(0) | Err(_) => {}
+            Ok(other) => eprintln!("Unexpected quit dialog response: {other}"),
+        },
+    );
+}
+
 fn set_pane_mode(
     requested_mode: PaneMode,
     pane_mode: &Rc<RefCell<PaneMode>>,
@@ -429,6 +524,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Open"), Some("win.open"));
     file_menu.append(Some("Save"), Some("win.save"));
+    file_menu.append(Some("Quit"), Some("win.quit"));
     menu_model.append_submenu(Some("File"), &file_menu);
 
     let edit_menu = gio::Menu::new();
@@ -478,6 +574,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         Rc::new(RefCell::new(file_path.map(str::to_owned)));
     let pane_mode = Rc::new(RefCell::new(PaneMode::Split));
     let last_split_position = Rc::new(RefCell::new(paned.position()));
+    let allow_close = Rc::new(RefCell::new(false));
 
     // ── Action: File → Open ─────────────────────────────────────────────────
     let open_action = gio::SimpleAction::new("open", None);
@@ -499,6 +596,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
                         match std::fs::read_to_string(&path) {
                             Ok(content) => {
                                 buf.set_text(&content);
+                                buf.set_modified(false);
                                 let name = path
                                     .file_name()
                                     .and_then(|n| n.to_str())
@@ -522,45 +620,37 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         let win = window.clone();
         let cf = current_file.clone();
         save_action.connect_activate(move |_, _| {
-            let path_opt = cf.borrow().clone();
-            let buf = buf.clone();
-            let win = win.clone();
-            let cf = cf.clone();
-            // do_write captures its own clones so win remains available below
-            // to pass as the parent for the save dialog.
-            let buf_w = buf.clone();
-            let win_w = win.clone();
-            let cf_w = cf.clone();
-            let do_write = move |path: std::path::PathBuf| {
-                let (start, end) = buf_w.bounds();
-                let text = buf_w.text(&start, &end, false);
-                if let Err(e) = std::fs::write(&path, text.as_str()) {
-                    eprintln!("Save error: {e}");
-                } else {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    win_w.set_title(Some(&format!("markdown_smith — {name}")));
-                    *cf_w.borrow_mut() = Some(path.to_string_lossy().into_owned());
-                }
-            };
-            match path_opt {
-                Some(p) => do_write(std::path::PathBuf::from(p)),
-                None => {
-                    let dialog = gtk4::FileDialog::new();
-                    dialog.save(Some(&win), gio::Cancellable::NONE, move |result| {
-                        if let Ok(file) = result {
-                            if let Some(path) = file.path() {
-                                do_write(path);
-                            }
-                        }
-                    });
-                }
-            }
+            save_buffer_or_prompt_for_path(buf.clone(), win.clone(), cf.clone(), || {});
         });
     }
     window.add_action(&save_action);
+
+    // ── Action: File → Quit ─────────────────────────────────────────────────
+    let quit_action = gio::SimpleAction::new("quit", None);
+    {
+        let buf = source_buffer.clone();
+        let win = window.clone();
+        let cf = current_file.clone();
+        let close_flag = allow_close.clone();
+        quit_action.connect_activate(move |_, _| {
+            request_quit(buf.clone(), win.clone(), cf.clone(), close_flag.clone());
+        });
+    }
+    window.add_action(&quit_action);
+
+    {
+        let buf = source_buffer.clone();
+        let cf = current_file.clone();
+        let close_flag = allow_close.clone();
+        window.connect_close_request(move |win| {
+            if *close_flag.borrow() || !buf.is_modified() {
+                return gtk4::glib::Propagation::Proceed;
+            }
+
+            request_quit(buf.clone(), win.clone(), cf.clone(), close_flag.clone());
+            gtk4::glib::Propagation::Stop
+        });
+    }
 
     // ── Action: Edit → Undo ─────────────────────────────────────────────────
     let undo_action = gio::SimpleAction::new("undo", None);
@@ -695,6 +785,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         ).to_string(),
     };
     source_buffer.set_text(&initial_text);
+    source_buffer.set_modified(false);
 
     // ── Show the window ─────────────────────────────────────────────────────
 
