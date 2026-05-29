@@ -5,8 +5,8 @@
 This is a small Rust GTK/libadwaita desktop app. The crate manifest is
 `Cargo.toml`, with locked dependency versions in `Cargo.lock`. Application code
 currently lives in `src/main.rs` as a single binary that builds the editor UI,
-converts Markdown to HTML with `pulldown-cmark`, and renders the live preview in
-WebKit. Development notes are in `markd_smith-plan.md`. Build artifacts are
+menu system, Markdown conversion, and WebKit live preview. Development notes are
+in `markd_smith-plan.md`. Build artifacts are
 generated under `target/` and should not be edited or committed.
 
 ## Build, Test, and Development Commands
@@ -31,6 +31,9 @@ prefer descriptive snake_case names for functions, variables, and modules. Use
 PascalCase for types and enums, and SCREAMING_SNAKE_CASE for constants. Follow
 the existing gtk-rs style: import prelude traits explicitly, keep widget setup
 grouped by UI area, and avoid broad rewrites unless extracting a focused module.
+For menu commands, prefer GTK/GIO actions with clear names such as `app.open` or
+`win.toggle-preview`, and keep labels, accelerators, and handlers grouped near
+the menu setup.
 
 ## Testing Guidelines
 
