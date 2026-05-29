@@ -1,0 +1,24 @@
+[package]
+name = "markdown_smith"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GTK4 Rust bindings. "v4_14" enables APIs added in GTK 4.14 — matches Ubuntu 24.04's
+# installed version (4.14.x). Drop to "v4_12" if you ever want to run on older distros.
+gtk4 = { version = "0.11", features = ["v4_14"] }
+
+# libadwaita — GNOME Human Interface Guidelines widgets (rounded windows, header bars, etc.)
+# Aliased as "adw" via `package = "libadwaita"` — the conventional short name in Rust code.
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+
+# GtkSourceView5 — syntax-highlighted text editor widget, a superset of gtk4::TextView.
+# Version 0.11 aligns with gtk4 0.11 (they share the same gtk4-sys ^0.11 dependency).
+sourceview5 = { version = "0.11", features = ["v5_12"] }
+
+# webkit6 — GTK4-native WebKit bindings (links against libwebkitgtk-6.0).
+# Note: this is NOT "webkit2gtk" — that crate links against the GTK3 version.
+webkit6 = { version = "0.6", features = ["v2_42"] }
+
+# pulldown-cmark — CommonMark-compliant markdown parser. Pure Rust, no system lib needed.
+pulldown-cmark = "0.13"
