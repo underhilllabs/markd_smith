@@ -23,7 +23,7 @@ use sourceview5::prelude::*;
 
 // LEARN: "adw" is the Cargo alias we gave libadwaita in Cargo.toml
 // (package = "libadwaita"). Everything GNOME-HIG-specific lives here.
-use adw::Application;
+use adw::{Application, ColorScheme, StyleManager};
 
 // LEARN: We only import the gtk4 types we reference by name. Everything else
 // comes in through the prelude traits above.
@@ -72,6 +72,21 @@ enum PaneMode {
     PreviewOnly,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    fn as_config_value(self) -> &'static str {
+        match self {
+            ThemeMode::Light => "light",
+            ThemeMode::Dark => "dark",
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MARKDOWN → HTML CONVERSION
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +94,7 @@ enum PaneMode {
 // LEARN: This function is pure — it has nothing to do with GTK. It takes a
 // &str (a borrowed string slice) and returns an owned String. It is called
 // from inside a GTK signal handler but is independently testable.
-fn markdown_to_html(markdown: &str) -> String {
+fn markdown_to_html(markdown: &str, theme_mode: ThemeMode) -> String {
     // LEARN: Options is a bitflag set. Options::all() enables every extension
     // (tables, footnotes, strikethrough, task lists, smart punctuation…).
     // Use Options::empty() for strict CommonMark only.
@@ -94,6 +109,27 @@ fn markdown_to_html(markdown: &str) -> String {
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
 
+    let (
+        background,
+        text,
+        pre_background,
+        code_background,
+        quote_border,
+        quote_text,
+        table_border,
+        table_header_background,
+        link,
+    ) = match theme_mode {
+        ThemeMode::Light => (
+            "#ffffff", "#1c1c1e", "#f5f5f5", "#f0f0f0", "#d0d0d0", "#555", "#ddd", "#f5f5f5",
+            "#0062cc",
+        ),
+        ThemeMode::Dark => (
+            "#1e1e1e", "#f2f2f2", "#2b2b2b", "#303030", "#5a5a5a", "#c7c7c7", "#4a4a4a", "#2b2b2b",
+            "#8ab4f8",
+        ),
+    };
+
     // Wrap in a minimal HTML document so WebKit gets correct UTF-8 and
     // sensible default typography. The double braces {{ }} are how you write
     // a literal { } inside a Rust format!() string.
@@ -103,6 +139,7 @@ fn markdown_to_html(markdown: &str) -> String {
 <head>
   <meta charset="UTF-8">
   <style>
+    html {{ background: {background}; }}
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 15px;
@@ -110,7 +147,8 @@ fn markdown_to_html(markdown: &str) -> String {
       max-width: 820px;
       margin: 0 auto;
       padding: 1.25rem 2rem;
-      color: #1c1c1e;
+      background: {background};
+      color: {text};
     }}
     h1, h2, h3, h4, h5, h6 {{
       margin-top: 1.5em;
@@ -118,7 +156,7 @@ fn markdown_to_html(markdown: &str) -> String {
       line-height: 1.25;
     }}
     pre {{
-      background: #f5f5f5;
+      background: {pre_background};
       padding: 0.9em 1em;
       border-radius: 6px;
       overflow-x: auto;
@@ -126,21 +164,21 @@ fn markdown_to_html(markdown: &str) -> String {
     code {{
       font-family: "JetBrains Mono", "Fira Code", monospace;
       font-size: 0.875em;
-      background: #f0f0f0;
+      background: {code_background};
       padding: 0.15em 0.35em;
       border-radius: 3px;
     }}
     pre code {{ background: none; padding: 0; }}
     blockquote {{
-      border-left: 4px solid #d0d0d0;
+      border-left: 4px solid {quote_border};
       margin: 0;
       padding-left: 1.1em;
-      color: #555;
+      color: {quote_text};
     }}
     table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
-    th, td {{ border: 1px solid #ddd; padding: 0.45em 0.75em; }}
-    th {{ background: #f5f5f5; font-weight: 600; }}
-    a {{ color: #0062cc; }}
+    th, td {{ border: 1px solid {table_border}; padding: 0.45em 0.75em; }}
+    th {{ background: {table_header_background}; font-weight: 600; }}
+    a {{ color: {link}; }}
     img {{ max-width: 100%; }}
   </style>
 </head>
@@ -151,14 +189,86 @@ fn markdown_to_html(markdown: &str) -> String {
     )
 }
 
-fn shortcut_config_path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(config_home).join("markdown_smith/shortcuts.conf"));
+        return Some(PathBuf::from(config_home).join("markd_smith"));
     }
 
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join(".config/markdown_smith/shortcuts.conf"))
+        .map(|home| home.join(".config/markdown_smith"))
+}
+
+fn settings_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("settings.conf"))
+}
+
+fn parse_theme_settings(contents: &str) -> ThemeMode {
+    let mut invalid_theme = None;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if key.trim() != "theme" {
+            continue;
+        }
+
+        match value.trim() {
+            "light" => return ThemeMode::Light,
+            "dark" => return ThemeMode::Dark,
+            other => invalid_theme = Some(other.to_string()),
+        }
+    }
+
+    if let Some(theme) = invalid_theme {
+        eprintln!("Invalid theme setting `{theme}`; falling back to light mode");
+    }
+
+    ThemeMode::Light
+}
+
+fn load_theme_mode() -> ThemeMode {
+    let Some(path) = settings_config_path() else {
+        return ThemeMode::Light;
+    };
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => parse_theme_settings(&contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ThemeMode::Light,
+        Err(err) => {
+            eprintln!("Could not read settings config: {err}");
+            ThemeMode::Light
+        }
+    }
+}
+
+fn save_theme_mode(theme_mode: ThemeMode) {
+    let Some(path) = settings_config_path() else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("Could not create settings config directory: {err}");
+            return;
+        }
+    }
+
+    let contents = format!("theme={}\n", theme_mode.as_config_value());
+    if let Err(err) = std::fs::write(&path, contents) {
+        eprintln!("Could not write settings config: {err}");
+    }
+}
+
+fn shortcut_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("shortcuts.conf"))
 }
 
 fn default_shortcut_config() -> String {
@@ -277,6 +387,47 @@ fn apply_configured_shortcuts(app: &Application) {
             app.set_accels_for_action(action, &[accel.as_str()]);
         }
     }
+}
+
+fn set_source_style_scheme_for_theme(
+    source_buffer: &Buffer,
+    scheme_manager: &StyleSchemeManager,
+    theme_mode: ThemeMode,
+) {
+    let scheme_ids = match theme_mode {
+        ThemeMode::Light => ["kate", "Adwaita", "classic"],
+        ThemeMode::Dark => ["Adwaita-dark", "solarized-dark", "cobalt"],
+    };
+
+    for scheme_id in scheme_ids {
+        if let Some(scheme) = scheme_manager.scheme(scheme_id) {
+            source_buffer.set_style_scheme(Some(&scheme));
+            return;
+        }
+    }
+
+    eprintln!("Could not find a GtkSourceView style scheme for {theme_mode:?}");
+}
+
+fn apply_theme(
+    source_buffer: &Buffer,
+    scheme_manager: &StyleSchemeManager,
+    style_manager: &StyleManager,
+    theme_mode: ThemeMode,
+) {
+    let color_scheme = match theme_mode {
+        ThemeMode::Light => ColorScheme::ForceLight,
+        ThemeMode::Dark => ColorScheme::ForceDark,
+    };
+
+    style_manager.set_color_scheme(color_scheme);
+    set_source_style_scheme_for_theme(source_buffer, scheme_manager, theme_mode);
+}
+
+fn render_preview(buffer: &Buffer, web_view: &WebView, theme_mode: ThemeMode) {
+    let (start, end) = buffer.bounds();
+    let markdown_text = buffer.text(&start, &end, false);
+    web_view.load_html(&markdown_to_html(markdown_text.as_str(), theme_mode), None);
 }
 
 fn write_buffer_to_path(
@@ -445,13 +596,17 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         source_buffer.set_highlight_syntax(true);
     }
 
-    // LEARN: StyleSchemeManager is another singleton. "kate" is a light
-    // scheme that ships with GtkSourceView. Other common ones: "classic",
-    // "cobalt" (dark), "solarized-dark".
+    // LEARN: StyleSchemeManager is another singleton. We use it below to keep
+    // the editor color scheme in sync with the app's light/dark theme.
     let scheme_manager = StyleSchemeManager::default();
-    if let Some(scheme) = scheme_manager.scheme("kate") {
-        source_buffer.set_style_scheme(Some(&scheme));
-    }
+    let style_manager = StyleManager::default();
+    let initial_theme_mode = load_theme_mode();
+    apply_theme(
+        &source_buffer,
+        &scheme_manager,
+        &style_manager,
+        initial_theme_mode,
+    );
 
     // LEARN: View::with_buffer() creates the editor widget pre-wired to our
     // buffer. Alternatively: View::new() then view.set_buffer(Some(&buf)).
@@ -534,6 +689,8 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     menu_model.append_submenu(Some("Edit"), &edit_menu);
 
     let view_menu = gio::Menu::new();
+    view_menu.append(Some("Light Mode"), Some("win.light-mode"));
+    view_menu.append(Some("Dark Mode"), Some("win.dark-mode"));
     view_menu.append(Some("Editor Only"), Some("win.editor-only"));
     view_menu.append(Some("Preview Only"), Some("win.preview-only"));
     view_menu.append(Some("Split View"), Some("win.split-view"));
@@ -574,6 +731,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     let current_file: Rc<RefCell<Option<String>>> =
         Rc::new(RefCell::new(file_path.map(str::to_owned)));
     let pane_mode = Rc::new(RefCell::new(PaneMode::Split));
+    let theme_mode = Rc::new(RefCell::new(initial_theme_mode));
     let last_split_position = Rc::new(RefCell::new(paned.position()));
     let allow_close = Rc::new(RefCell::new(false));
 
@@ -677,6 +835,39 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     }
     window.add_action(&redo_action);
 
+    // ── Actions: View → theme modes ─────────────────────────────────────────
+    let light_mode_action = gio::SimpleAction::new("light-mode", None);
+    {
+        let mode = theme_mode.clone();
+        let buf = source_buffer.clone();
+        let preview = web_view.clone();
+        let schemes = scheme_manager.clone();
+        let styles = style_manager.clone();
+        light_mode_action.connect_activate(move |_, _| {
+            *mode.borrow_mut() = ThemeMode::Light;
+            apply_theme(&buf, &schemes, &styles, ThemeMode::Light);
+            render_preview(&buf, &preview, ThemeMode::Light);
+            save_theme_mode(ThemeMode::Light);
+        });
+    }
+    window.add_action(&light_mode_action);
+
+    let dark_mode_action = gio::SimpleAction::new("dark-mode", None);
+    {
+        let mode = theme_mode.clone();
+        let buf = source_buffer.clone();
+        let preview = web_view.clone();
+        let schemes = scheme_manager.clone();
+        let styles = style_manager.clone();
+        dark_mode_action.connect_activate(move |_, _| {
+            *mode.borrow_mut() = ThemeMode::Dark;
+            apply_theme(&buf, &schemes, &styles, ThemeMode::Dark);
+            render_preview(&buf, &preview, ThemeMode::Dark);
+            save_theme_mode(ThemeMode::Dark);
+        });
+    }
+    window.add_action(&dark_mode_action);
+
     // ── Actions: View → pane modes ──────────────────────────────────────────
     let editor_only_action = gio::SimpleAction::new("editor-only", None);
     {
@@ -751,20 +942,12 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     // prevent moving web_view into the closure while we still use it above.
     // Cloning a GObject is cheap — it just increments a reference counter.
     let web_view_clone = web_view.clone();
+    let theme_mode_clone = theme_mode.clone();
     source_buffer.connect_changed(move |buffer| {
-        // LEARN: buffer.bounds() returns (start_iter, end_iter) in one call.
-        // A TextIter is a cursor position inside the text buffer.
-        let (start, end) = buffer.bounds();
-
-        // LEARN: buffer.text() extracts the UTF-8 string between two iterators.
-        // false = exclude hidden characters (invisible spans used by some
-        // widgets — irrelevant here). Returns a glib::GString that derefs to &str.
-        let markdown_text = buffer.text(&start, &end, false);
-
         // Convert and reload. load_html(content, base_uri):
         //   base_uri = None means no base URL for relative resources,
         //   which is fine since our CSS is inline.
-        web_view_clone.load_html(&markdown_to_html(markdown_text.as_str()), None);
+        render_preview(buffer, &web_view_clone, *theme_mode_clone.borrow());
     });
 
     // ── Load initial content into the buffer ────────────────────────────────
@@ -811,6 +994,30 @@ mod tests {
         parse_shortcut_config_with_validator(contents, &known_actions(), |accel| {
             accel.starts_with('<')
         })
+    }
+
+    #[test]
+    fn parses_light_theme_setting() {
+        assert_eq!(parse_theme_settings("theme=light\n"), ThemeMode::Light);
+    }
+
+    #[test]
+    fn parses_dark_theme_setting() {
+        assert_eq!(parse_theme_settings("theme=dark\n"), ThemeMode::Dark);
+    }
+
+    #[test]
+    fn theme_settings_ignore_comments_and_blank_lines() {
+        assert_eq!(
+            parse_theme_settings("\n# comment\n  \ntheme=dark\n"),
+            ThemeMode::Dark
+        );
+    }
+
+    #[test]
+    fn theme_settings_fall_back_to_light_when_missing_or_invalid() {
+        assert_eq!(parse_theme_settings(""), ThemeMode::Light);
+        assert_eq!(parse_theme_settings("theme=blue\n"), ThemeMode::Light);
     }
 
     #[test]
