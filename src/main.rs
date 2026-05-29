@@ -309,7 +309,8 @@ fn save_buffer_or_prompt_for_path(
     current_file: Rc<RefCell<Option<String>>>,
     after_save: impl FnOnce() + 'static,
 ) {
-    if let Some(path) = current_file.borrow().clone() {
+    let existing_path = current_file.borrow().clone();
+    if let Some(path) = existing_path {
         if write_buffer_to_path(&buffer, &window, &current_file, PathBuf::from(path)) {
             after_save();
         }
