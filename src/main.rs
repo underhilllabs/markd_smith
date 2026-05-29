@@ -48,6 +48,10 @@ use webkit6::prelude::WebViewExt;
 // collects those events and writes HTML into a String.
 use pulldown_cmark::{html, Options, Parser};
 
+use std::rc::Rc;
+use std::cell::RefCell;
+use gtk4::gio;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MARKDOWN → HTML CONVERSION
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,6 +239,22 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     toolbar_view.add_top_bar(&header_bar);
     toolbar_view.set_content(Some(&paned));
 
+    // ── Menu bar (File | Edit) ──────────────────────────────────────────────
+    let menu_model = gio::Menu::new();
+
+    let file_menu = gio::Menu::new();
+    file_menu.append(Some("Open"), Some("win.open"));
+    file_menu.append(Some("Save"), Some("win.save"));
+    menu_model.append_submenu(Some("File"), &file_menu);
+
+    let edit_menu = gio::Menu::new();
+    edit_menu.append(Some("Undo"), Some("win.undo"));
+    edit_menu.append(Some("Redo"), Some("win.redo"));
+    menu_model.append_submenu(Some("Edit"), &edit_menu);
+
+    let menu_bar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
+    toolbar_view.add_top_bar(&menu_bar);
+
     // ── Application window ──────────────────────────────────────────────────
 
     // LEARN: adw::ApplicationWindow is the top-level window. Using the Adwaita
@@ -262,6 +282,122 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     // LEARN: adw::ApplicationWindow uses set_content() (from AdwApplicationWindowExt)
     // instead of gtk4's set_child(). Pass the ToolbarView as the sole content.
     window.set_content(Some(&toolbar_view));
+
+    // ── Shared state: path of the currently open file ───────────────────────
+    let current_file: Rc<RefCell<Option<String>>> =
+        Rc::new(RefCell::new(file_path.map(str::to_owned)));
+
+    // ── Action: File → Open ─────────────────────────────────────────────────
+    let open_action = gio::SimpleAction::new("open", None);
+    {
+        let buf = source_buffer.clone();
+        let win = window.clone();
+        let cf = current_file.clone();
+        open_action.connect_activate(move |_, _| {
+            let buf = buf.clone();
+            let win = win.clone();
+            let cf = cf.clone();
+            // win_cb is moved into the callback; win is only borrowed for the
+            // duration of the dialog.open() call itself (to set the parent window).
+            let win_cb = win.clone();
+            let dialog = gtk4::FileDialog::new();
+            dialog.open(Some(&win), gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        match std::fs::read_to_string(&path) {
+                            Ok(content) => {
+                                buf.set_text(&content);
+                                let name = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("unknown");
+                                win_cb.set_title(Some(&format!("markdown_smith — {name}")));
+                                *cf.borrow_mut() =
+                                    Some(path.to_string_lossy().into_owned());
+                            }
+                            Err(e) => eprintln!("Open error: {e}"),
+                        }
+                    }
+                }
+            });
+        });
+    }
+    window.add_action(&open_action);
+    app.set_accels_for_action("win.open", &["<Control>o"]);
+
+    // ── Action: File → Save ─────────────────────────────────────────────────
+    let save_action = gio::SimpleAction::new("save", None);
+    {
+        let buf = source_buffer.clone();
+        let win = window.clone();
+        let cf = current_file.clone();
+        save_action.connect_activate(move |_, _| {
+            let path_opt = cf.borrow().clone();
+            let buf = buf.clone();
+            let win = win.clone();
+            let cf = cf.clone();
+            // do_write captures its own clones so win remains available below
+            // to pass as the parent for the save dialog.
+            let buf_w = buf.clone();
+            let win_w = win.clone();
+            let cf_w = cf.clone();
+            let do_write = move |path: std::path::PathBuf| {
+                let (start, end) = buf_w.bounds();
+                let text = buf_w.text(&start, &end, false);
+                if let Err(e) = std::fs::write(&path, text.as_str()) {
+                    eprintln!("Save error: {e}");
+                } else {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
+                    win_w.set_title(Some(&format!("markdown_smith — {name}")));
+                    *cf_w.borrow_mut() = Some(path.to_string_lossy().into_owned());
+                }
+            };
+            match path_opt {
+                Some(p) => do_write(std::path::PathBuf::from(p)),
+                None => {
+                    let dialog = gtk4::FileDialog::new();
+                    dialog.save(Some(&win), gio::Cancellable::NONE, move |result| {
+                        if let Ok(file) = result {
+                            if let Some(path) = file.path() {
+                                do_write(path);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+    }
+    window.add_action(&save_action);
+    app.set_accels_for_action("win.save", &["<Control>s"]);
+
+    // ── Action: Edit → Undo ─────────────────────────────────────────────────
+    let undo_action = gio::SimpleAction::new("undo", None);
+    {
+        let buf = source_buffer.clone();
+        undo_action.connect_activate(move |_, _| {
+            if buf.can_undo() {
+                buf.undo();
+            }
+        });
+    }
+    window.add_action(&undo_action);
+    app.set_accels_for_action("win.undo", &["<Control>z"]);
+
+    // ── Action: Edit → Redo ─────────────────────────────────────────────────
+    let redo_action = gio::SimpleAction::new("redo", None);
+    {
+        let buf = source_buffer.clone();
+        redo_action.connect_activate(move |_, _| {
+            if buf.can_redo() {
+                buf.redo();
+            }
+        });
+    }
+    window.add_action(&redo_action);
+    app.set_accels_for_action("win.redo", &["<Control><Shift>z"]);
 
     // ── Signal: buffer changed → re-render preview ──────────────────────────
 
