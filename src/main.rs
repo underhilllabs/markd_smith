@@ -27,6 +27,7 @@ use adw::{Application, ColorScheme, StyleManager};
 
 // LEARN: We only import the gtk4 types we reference by name. Everything else
 // comes in through the prelude traits above.
+use gtk4::{gdk, EventControllerKey, PropagationPhase};
 use gtk4::{Orientation, PolicyType, ScrolledWindow, WrapMode};
 
 // LEARN: sourceview5 provides the syntax-highlighted editor widget.
@@ -563,6 +564,68 @@ fn set_pane_mode(
     *pane_mode.borrow_mut() = next_mode;
 }
 
+fn install_focus_pane_shortcuts(
+    window: &adw::ApplicationWindow,
+    source_view: &View,
+    web_view: &WebView,
+    pane_mode: Rc<RefCell<PaneMode>>,
+    last_split_position: Rc<RefCell<i32>>,
+    paned: gtk4::Paned,
+    editor_scroll: ScrolledWindow,
+) {
+    let key_controller = EventControllerKey::new();
+    key_controller.set_propagation_phase(PropagationPhase::Capture);
+
+    let chord_pending = Rc::new(RefCell::new(false));
+    {
+        let chord_pending = chord_pending.clone();
+        let editor = source_view.clone();
+        let preview = web_view.clone();
+        key_controller.connect_key_pressed(move |_, key, _, state| {
+            if *chord_pending.borrow() {
+                *chord_pending.borrow_mut() = false;
+
+                match key {
+                    gdk::Key::Left => {
+                        set_pane_mode(
+                            PaneMode::Split,
+                            &pane_mode,
+                            &last_split_position,
+                            &paned,
+                            &editor_scroll,
+                            &preview,
+                        );
+                        editor.grab_focus();
+                        gtk4::glib::Propagation::Stop
+                    }
+                    gdk::Key::Right => {
+                        set_pane_mode(
+                            PaneMode::Split,
+                            &pane_mode,
+                            &last_split_position,
+                            &paned,
+                            &editor_scroll,
+                            &preview,
+                        );
+                        preview.grab_focus();
+                        gtk4::glib::Propagation::Stop
+                    }
+                    _ => gtk4::glib::Propagation::Proceed,
+                }
+            } else if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && matches!(key, gdk::Key::w | gdk::Key::W)
+            {
+                *chord_pending.borrow_mut() = true;
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
+            }
+        });
+    }
+
+    window.add_controller(key_controller);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // UI CONSTRUCTION
 // ─────────────────────────────────────────────────────────────────────────────
@@ -643,6 +706,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     // separate web process under the hood (sandboxed), but we interact with it
     // purely through load_html() — no JavaScript needed.
     let web_view = WebView::new();
+    web_view.set_focusable(true);
     web_view.set_vexpand(true);
     web_view.set_hexpand(true);
 
@@ -734,6 +798,16 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     let theme_mode = Rc::new(RefCell::new(initial_theme_mode));
     let last_split_position = Rc::new(RefCell::new(paned.position()));
     let allow_close = Rc::new(RefCell::new(false));
+
+    install_focus_pane_shortcuts(
+        &window,
+        &source_view,
+        &web_view,
+        pane_mode.clone(),
+        last_split_position.clone(),
+        paned.clone(),
+        editor_scroll.clone(),
+    );
 
     // ── Action: File → Open ─────────────────────────────────────────────────
     let open_action = gio::SimpleAction::new("open", None);
@@ -1082,7 +1156,7 @@ fn main() {
     let file_path: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
 
     let app = Application::new(
-        Some("com.example.markdown-smith"),
+        Some("io.github.underhilllabs.MarkdSmith"),
         gtk4::gio::ApplicationFlags::empty(),
     );
 
