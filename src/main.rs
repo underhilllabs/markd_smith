@@ -64,6 +64,7 @@ const DEFAULT_SHORTCUTS: &[(&str, &str)] = &[
     ("win.editor-only", "<Control>1"),
     ("win.preview-only", "<Control>2"),
     ("win.split-view", "<Control>0"),
+    ("win.swap-panes", "<Control><Shift>x"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -564,12 +565,42 @@ fn set_pane_mode(
     *pane_mode.borrow_mut() = next_mode;
 }
 
+// LEARN: gtk4::Paned identifies its two children by position (start/end), not
+// by identity — swapping which widget occupies which slot is enough to flip
+// the visual layout. The divider position (in pixels from the left edge) is
+// left untouched, so the split ratio looks the same after swapping.
+fn swap_panes(
+    panes_swapped: &Rc<RefCell<bool>>,
+    paned: &gtk4::Paned,
+    editor_scroll: &ScrolledWindow,
+    web_view: &WebView,
+) {
+    let swapped = !*panes_swapped.borrow();
+    *panes_swapped.borrow_mut() = swapped;
+
+    // LEARN: Paned::set_*_child asserts the child is unparented (or already
+    // in that slot) before accepting it — so a widget can't move directly
+    // from one slot to the other. Clear both slots first, then reassign.
+    paned.set_start_child(gtk4::Widget::NONE);
+    paned.set_end_child(gtk4::Widget::NONE);
+
+    if swapped {
+        paned.set_start_child(Some(web_view));
+        paned.set_end_child(Some(editor_scroll));
+    } else {
+        paned.set_start_child(Some(editor_scroll));
+        paned.set_end_child(Some(web_view));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn install_focus_pane_shortcuts(
     window: &adw::ApplicationWindow,
     source_view: &View,
     web_view: &WebView,
     pane_mode: Rc<RefCell<PaneMode>>,
     last_split_position: Rc<RefCell<i32>>,
+    panes_swapped: Rc<RefCell<bool>>,
     paned: gtk4::Paned,
     editor_scroll: ScrolledWindow,
 ) {
@@ -585,6 +616,16 @@ fn install_focus_pane_shortcuts(
             if *chord_pending.borrow() {
                 *chord_pending.borrow_mut() = false;
 
+                // Panes can be swapped (View → Swap Panes), so "jump left"/
+                // "jump right" must resolve to whichever widget currently
+                // occupies that side rather than a fixed editor/preview pairing.
+                let (left_widget, right_widget): (&gtk4::Widget, &gtk4::Widget) =
+                    if *panes_swapped.borrow() {
+                        (preview.upcast_ref(), editor.upcast_ref())
+                    } else {
+                        (editor.upcast_ref(), preview.upcast_ref())
+                    };
+
                 match key {
                     gdk::Key::Left => {
                         set_pane_mode(
@@ -595,7 +636,7 @@ fn install_focus_pane_shortcuts(
                             &editor_scroll,
                             &preview,
                         );
-                        editor.grab_focus();
+                        left_widget.grab_focus();
                         gtk4::glib::Propagation::Stop
                     }
                     gdk::Key::Right => {
@@ -607,7 +648,7 @@ fn install_focus_pane_shortcuts(
                             &editor_scroll,
                             &preview,
                         );
-                        preview.grab_focus();
+                        right_widget.grab_focus();
                         gtk4::glib::Propagation::Stop
                     }
                     _ => gtk4::glib::Propagation::Proceed,
@@ -629,6 +670,35 @@ fn install_focus_pane_shortcuts(
 // ─────────────────────────────────────────────────────────────────────────────
 // UI CONSTRUCTION
 // ─────────────────────────────────────────────────────────────────────────────
+
+// LEARN: gio::Menu (unlike gtk4 widgets) needs no display connection to
+// construct or inspect, which makes the menu structure itself unit-testable
+// — see `tests::menu_bar_has_expected_structure` below.
+fn build_menu_model() -> gio::Menu {
+    let menu_model = gio::Menu::new();
+
+    let file_menu = gio::Menu::new();
+    file_menu.append(Some("Open"), Some("win.open"));
+    file_menu.append(Some("Save"), Some("win.save"));
+    file_menu.append(Some("Quit"), Some("win.quit"));
+    menu_model.append_submenu(Some("File"), &file_menu);
+
+    let edit_menu = gio::Menu::new();
+    edit_menu.append(Some("Undo"), Some("win.undo"));
+    edit_menu.append(Some("Redo"), Some("win.redo"));
+    menu_model.append_submenu(Some("Edit"), &edit_menu);
+
+    let view_menu = gio::Menu::new();
+    view_menu.append(Some("Light Mode"), Some("win.light-mode"));
+    view_menu.append(Some("Dark Mode"), Some("win.dark-mode"));
+    view_menu.append(Some("Editor Only"), Some("win.editor-only"));
+    view_menu.append(Some("Preview Only"), Some("win.preview-only"));
+    view_menu.append(Some("Split View"), Some("win.split-view"));
+    view_menu.append(Some("Swap Panes"), Some("win.swap-panes"));
+    menu_model.append_submenu(Some("View"), &view_menu);
+
+    menu_model
+}
 
 // LEARN: GTK4 apps separate "create the Application object" (main) from
 // "build the window" (this function). The "activate" signal fires when the
@@ -739,26 +809,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     toolbar_view.set_content(Some(&paned));
 
     // ── Menu bar (File | Edit) ──────────────────────────────────────────────
-    let menu_model = gio::Menu::new();
-
-    let file_menu = gio::Menu::new();
-    file_menu.append(Some("Open"), Some("win.open"));
-    file_menu.append(Some("Save"), Some("win.save"));
-    file_menu.append(Some("Quit"), Some("win.quit"));
-    menu_model.append_submenu(Some("File"), &file_menu);
-
-    let edit_menu = gio::Menu::new();
-    edit_menu.append(Some("Undo"), Some("win.undo"));
-    edit_menu.append(Some("Redo"), Some("win.redo"));
-    menu_model.append_submenu(Some("Edit"), &edit_menu);
-
-    let view_menu = gio::Menu::new();
-    view_menu.append(Some("Light Mode"), Some("win.light-mode"));
-    view_menu.append(Some("Dark Mode"), Some("win.dark-mode"));
-    view_menu.append(Some("Editor Only"), Some("win.editor-only"));
-    view_menu.append(Some("Preview Only"), Some("win.preview-only"));
-    view_menu.append(Some("Split View"), Some("win.split-view"));
-    menu_model.append_submenu(Some("View"), &view_menu);
+    let menu_model = build_menu_model();
 
     let menu_bar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
     toolbar_view.add_top_bar(&menu_bar);
@@ -797,6 +848,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     let pane_mode = Rc::new(RefCell::new(PaneMode::Split));
     let theme_mode = Rc::new(RefCell::new(initial_theme_mode));
     let last_split_position = Rc::new(RefCell::new(paned.position()));
+    let panes_swapped = Rc::new(RefCell::new(false));
     let allow_close = Rc::new(RefCell::new(false));
 
     install_focus_pane_shortcuts(
@@ -805,6 +857,7 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         &web_view,
         pane_mode.clone(),
         last_split_position.clone(),
+        panes_swapped.clone(),
         paned.clone(),
         editor_scroll.clone(),
     );
@@ -1003,6 +1056,18 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     }
     window.add_action(&split_view_action);
 
+    let swap_panes_action = gio::SimpleAction::new("swap-panes", None);
+    {
+        let panes_swapped = panes_swapped.clone();
+        let paned = paned.clone();
+        let editor = editor_scroll.clone();
+        let preview = web_view.clone();
+        swap_panes_action.connect_activate(move |_, _| {
+            swap_panes(&panes_swapped, &paned, &editor, &preview);
+        });
+    }
+    window.add_action(&swap_panes_action);
+
     apply_configured_shortcuts(app);
 
     // ── Signal: buffer changed → re-render preview ──────────────────────────
@@ -1133,6 +1198,71 @@ mod tests {
 
         assert!(!shortcuts.contains_key("win.open"));
         assert_eq!(shortcuts.get("win.save"), Some(&"<Control>s".to_string()));
+    }
+
+    // Walks a gio::MenuModel's top-level submenus, returning
+    // (submenu_label, [(item_label, action_name), ...]) pairs in order.
+    fn menu_structure(menu: &gio::Menu) -> Vec<(String, Vec<(String, String)>)> {
+        let attr_string = |menu: &gio::MenuModel, index: i32, attribute: &str| -> Option<String> {
+            menu.item_attribute_value(index, attribute, Some(gtk4::glib::VariantTy::STRING))
+                .and_then(|v| v.get::<String>())
+        };
+
+        (0..menu.n_items())
+            .map(|i| {
+                let label = attr_string(menu.upcast_ref(), i, "label").unwrap_or_default();
+                let submenu = menu
+                    .item_link(i, "submenu")
+                    .expect("top-level menu item should be a submenu");
+
+                let items = (0..submenu.n_items())
+                    .map(|j| {
+                        let item_label = attr_string(&submenu, j, "label").unwrap_or_default();
+                        let action = attr_string(&submenu, j, "action").unwrap_or_default();
+                        (item_label, action)
+                    })
+                    .collect();
+
+                (label, items)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_bar_has_expected_structure() {
+        let structure = menu_structure(&build_menu_model());
+
+        assert_eq!(
+            structure,
+            vec![
+                (
+                    "File".to_string(),
+                    vec![
+                        ("Open".to_string(), "win.open".to_string()),
+                        ("Save".to_string(), "win.save".to_string()),
+                        ("Quit".to_string(), "win.quit".to_string()),
+                    ]
+                ),
+                (
+                    "Edit".to_string(),
+                    vec![
+                        ("Undo".to_string(), "win.undo".to_string()),
+                        ("Redo".to_string(), "win.redo".to_string()),
+                    ]
+                ),
+                (
+                    "View".to_string(),
+                    vec![
+                        ("Light Mode".to_string(), "win.light-mode".to_string()),
+                        ("Dark Mode".to_string(), "win.dark-mode".to_string()),
+                        ("Editor Only".to_string(), "win.editor-only".to_string()),
+                        ("Preview Only".to_string(), "win.preview-only".to_string()),
+                        ("Split View".to_string(), "win.split-view".to_string()),
+                        ("Swap Panes".to_string(), "win.swap-panes".to_string()),
+                    ]
+                ),
+            ]
+        );
     }
 }
 

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Markd Smith Markdown editor icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7F0E1"/>
+      <stop offset="1" stop-color="#F4ECDA"/>
+    </linearGradient>
+  </defs>
+  <!-- background -->
+  <rect x="0" y="0" width="512" height="512" rx="114" ry="114" fill="url(#bg)"/>
+  <!-- subtle inset frame for definition on light surfaces -->
+  <rect x="14" y="14" width="484" height="484" rx="102" ry="102" fill="none" stroke="#184734" stroke-opacity="0.14" stroke-width="3"/>
+  <!-- Md wordmark (outlined glyphs, font-independent) -->
+  <g transform="translate(113.00 350.29) scale(2.5292 -2.5292)" fill="#184734">
+    <path d="M4.20 72.91 L21.39 72.91 L30.08 40.92 L38.72 72.91 L56.00 72.91 L56.00 0.00 L43.61 0.00 L43.61 58.41 L35.89 26.52 L24.42 26.52 L16.61 58.41 L16.61 0.00 L4.20 0.00 L4.20 72.91 Z M98.83 46.92 L98.83 75.98 L113.08 75.98 L113.08 0.00 L98.83 0.00 L98.83 8.11 Q96.53 3.38 92.89 0.97 Q89.25 -1.42 84.33 -1.42 Q74.96 -1.42 69.77 6.09 Q64.60 13.62 64.60 27.30 Q64.60 41.16 69.85 48.58 Q75.10 56.00 84.81 56.00 Q89.21 56.00 92.69 53.73 Q96.19 51.47 98.83 46.92 Z M78.91 27.20 Q78.91 19.28 81.53 14.78 Q84.17 10.30 88.81 10.30 Q93.46 10.30 96.14 14.78 Q98.83 19.28 98.83 27.20 Q98.83 35.11 96.14 39.59 Q93.46 44.09 88.81 44.09 Q84.17 44.09 81.53 39.59 Q78.91 35.11 78.91 27.20 Z"/>
+  </g>
+  <!-- setext-style heading underline (Markdown nod) -->
+  <rect x="167.34" y="379.89" width="177.32" height="16" rx="8.0" ry="8.0" fill="#184734"/>
+</svg>

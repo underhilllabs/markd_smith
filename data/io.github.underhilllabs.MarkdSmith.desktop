@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Markd Smith
+GenericName=Markdown Editor
+Comment=Edit and preview Markdown
+Exec=markd_smith %F
+Icon=io.github.underhilllabs.MarkdSmith
+Terminal=false
+Categories=Office;TextEditor;GTK;
+MimeType=text/markdown;text/plain;
+StartupNotify=true
+StartupWMClass=io.github.underhilllabs.MarkdSmith

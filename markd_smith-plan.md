@@ -1,5 +1,6 @@
 # markdown_smith: GTK4 Markdown Editor — Implementation Plan
 
+
 ## Context
 
 Build a brand-new Rust desktop application for GNOME/Ubuntu 24.04 that is a split-pane markdown editor: raw markdown on the left (with syntax highlighting), live HTML preview on the right. The user is new to Rust and GTK4, so this is explicitly a learning project — all code lives in a single `src/main.rs` with explanatory comments, no premature abstractions.
