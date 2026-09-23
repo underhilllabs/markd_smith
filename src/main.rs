@@ -47,7 +47,7 @@ use webkit6::prelude::WebViewExt;
 // LEARN: pulldown-cmark is a pure-Rust markdown parser. Parser is a lazy
 // iterator yielding Events (Start, End, Text, Code, …). html::push_html
 // collects those events and writes HTML into a String.
-use pulldown_cmark::{html, Options, Parser};
+use pulldown_cmark::{html, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use gtk4::gio;
 use std::cell::RefCell;
@@ -65,7 +65,28 @@ const DEFAULT_SHORTCUTS: &[(&str, &str)] = &[
     ("win.preview-only", "<Control>2"),
     ("win.split-view", "<Control>0"),
     ("win.swap-panes", "<Control><Shift>x"),
+    ("win.zoom-in", "<Control>plus"),
+    ("win.zoom-out", "<Control>minus"),
+    ("win.zoom-reset", "<Control><Shift>0"),
 ];
+
+// Extra accelerators registered alongside the configured one, never written to
+// shortcuts.conf. On most layouts "+" is Shift+=, so a bare Ctrl+= must also
+// zoom in — that is what every browser does — and the numeric keypad sends its
+// own distinct keysyms.
+const SHORTCUT_ALIASES: &[(&str, &str)] = &[
+    ("win.zoom-in", "<Control>equal"),
+    ("win.zoom-in", "<Control>KP_Add"),
+    ("win.zoom-out", "<Control>KP_Subtract"),
+    ("win.zoom-reset", "<Control>KP_0"),
+];
+
+// Zoom is a multiplier applied to both panes at once. The bounds keep the UI
+// usable at the extremes; the step matches the ~10% increments browsers use.
+const ZOOM_MIN: f64 = 0.5;
+const ZOOM_MAX: f64 = 3.0;
+const ZOOM_STEP: f64 = 1.1;
+const ZOOM_DEFAULT: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaneMode {
@@ -93,23 +114,87 @@ impl ThemeMode {
 // MARKDOWN → HTML CONVERSION
 // ─────────────────────────────────────────────────────────────────────────────
 
+// LEARN: include_str! embeds a file's contents into the binary at compile
+// time, so the preview renders diagrams with no network access and no
+// dependency on a CDN staying online. The bundle is a classic (non-module)
+// script that assigns globalThis.mermaid, so a plain <script> tag works.
+const MERMAID_JS: &str = include_str!("../assets/mermaid.min.js");
+
+// Minimal HTML escaping for text we drop into the document verbatim. Mermaid
+// reads the diagram source as the element's text content, so `A --> B` must
+// not be mistaken for markup.
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+// Render the markdown body, turning ```mermaid fences into the `<pre
+// class="mermaid">` blocks mermaid.js looks for instead of syntax-highlighted
+// code. Returns the HTML fragment plus whether any diagram was found, so the
+// caller only pays for the (large) mermaid bundle on documents that use it.
+//
+// LEARN: pulldown-cmark hands us a stream of Events. Mapping over that stream
+// before it reaches html::push_html is the idiomatic way to special-case one
+// kind of node — we swallow the events inside a mermaid fence and emit a
+// single Event::Html in their place.
+fn render_markdown_body(markdown: &str) -> (String, bool) {
+    let options = Options::all();
+    let parser = Parser::new_ext(markdown, options);
+
+    let mut events = Vec::new();
+    let mut diagram_source: Option<String> = None;
+    let mut has_diagram = false;
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref language)))
+                if language.trim().eq_ignore_ascii_case("mermaid") =>
+            {
+                diagram_source = Some(String::new());
+            }
+            Event::Text(ref text) if diagram_source.is_some() => {
+                // A fenced block can yield several Text events; concatenate them.
+                diagram_source
+                    .as_mut()
+                    .expect("checked by the guard above")
+                    .push_str(text);
+            }
+            Event::End(TagEnd::CodeBlock) if diagram_source.is_some() => {
+                let source = diagram_source.take().expect("checked by the guard above");
+                has_diagram = true;
+                events.push(Event::Html(
+                    format!(
+                        "<pre class=\"mermaid\">{}</pre>\n",
+                        escape_html(source.trim_end())
+                    )
+                    .into(),
+                ));
+            }
+            other => events.push(other),
+        }
+    }
+
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, events.into_iter());
+    (html_output, has_diagram)
+}
+
 // LEARN: This function is pure — it has nothing to do with GTK. It takes a
 // &str (a borrowed string slice) and returns an owned String. It is called
 // from inside a GTK signal handler but is independently testable.
 fn markdown_to_html(markdown: &str, theme_mode: ThemeMode) -> String {
-    // LEARN: Options is a bitflag set. Options::all() enables every extension
-    // (tables, footnotes, strikethrough, task lists, smart punctuation…).
-    // Use Options::empty() for strict CommonMark only.
-    let options = Options::all();
-
-    // LEARN: Parser::new_ext returns a lazy iterator over markdown events.
-    // Nothing is parsed until you consume it (via html::push_html below).
-    let parser = Parser::new_ext(markdown, options);
-
-    // LEARN: html::push_html drains the parser iterator and appends HTML to
-    // the provided String. After this call, html_output holds the fragment.
-    let mut html_output = String::new();
-    html::push_html(&mut html_output, parser);
+    // The body (including any mermaid blocks) is produced by
+    // render_markdown_body; this function only wraps it in a themed document.
+    let (html_output, has_diagram) = render_markdown_body(markdown);
 
     let (
         background,
@@ -121,15 +206,29 @@ fn markdown_to_html(markdown: &str, theme_mode: ThemeMode) -> String {
         table_border,
         table_header_background,
         link,
+        mermaid_theme,
     ) = match theme_mode {
         ThemeMode::Light => (
             "#ffffff", "#1c1c1e", "#f5f5f5", "#f0f0f0", "#d0d0d0", "#555", "#ddd", "#f5f5f5",
-            "#0062cc",
+            "#0062cc", "default",
         ),
         ThemeMode::Dark => (
             "#1e1e1e", "#f2f2f2", "#2b2b2b", "#303030", "#5a5a5a", "#c7c7c7", "#4a4a4a", "#2b2b2b",
-            "#8ab4f8",
+            "#8ab4f8", "dark",
         ),
+    };
+
+    // Only embed the multi-megabyte mermaid bundle when the document actually
+    // contains a diagram — the preview reloads on every keystroke.
+    let mermaid_script = if has_diagram {
+        format!(
+            r#"<script>{MERMAID_JS}</script>
+<script>
+  mermaid.initialize({{ startOnLoad: true, theme: "{mermaid_theme}", securityLevel: "strict" }});
+</script>"#
+        )
+    } else {
+        String::new()
     };
 
     // Wrap in a minimal HTML document so WebKit gets correct UTF-8 and
@@ -182,10 +281,21 @@ fn markdown_to_html(markdown: &str, theme_mode: ThemeMode) -> String {
     th {{ background: {table_header_background}; font-weight: 600; }}
     a {{ color: {link}; }}
     img {{ max-width: 100%; }}
+    pre.mermaid {{
+      background: none;
+      padding: 0;
+      text-align: center;
+      /* Hidden until mermaid swaps the source text for an <svg>, so the raw
+         diagram definition never flashes on screen mid-render. */
+      visibility: hidden;
+    }}
+    pre.mermaid[data-processed="true"] {{ visibility: visible; }}
+    pre.mermaid svg {{ max-width: 100%; height: auto; }}
   </style>
 </head>
 <body>
 {html_output}
+{mermaid_script}
 </body>
 </html>"#
     )
@@ -267,6 +377,73 @@ fn save_theme_mode(theme_mode: ThemeMode) {
     if let Err(err) = std::fs::write(&path, contents) {
         eprintln!("Could not write settings config: {err}");
     }
+}
+
+// The most-recently-opened files, newest first, are persisted one path per line
+// in this file so the "Open Recent" menu survives across launches.
+const MAX_RECENT_FILES: usize = 10;
+
+fn recent_files_config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("recent_files"))
+}
+
+fn load_recent_files() -> Vec<String> {
+    let Some(path) = recent_files_config_path() else {
+        return Vec::new();
+    };
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            eprintln!("Could not read recent files: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn save_recent_files(paths: &[String]) {
+    let Some(path) = recent_files_config_path() else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("Could not create recent files directory: {err}");
+            return;
+        }
+    }
+
+    // One path per line; a trailing newline keeps the file POSIX-friendly.
+    let mut contents = paths.join("\n");
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    if let Err(err) = std::fs::write(&path, contents) {
+        eprintln!("Could not write recent files: {err}");
+    }
+}
+
+// Pure list transform: move `path` to the front, drop any earlier appearance,
+// and cap the length. Split out from I/O so it can be unit-tested.
+fn recent_list_with(mut recent: Vec<String>, path: &str, max: usize) -> Vec<String> {
+    recent.retain(|existing| existing != path);
+    recent.insert(0, path.to_owned());
+    recent.truncate(max);
+    recent
+}
+
+// Move `path` to the front of the recent list, persist it, and return the
+// updated list.
+fn push_recent_file(path: &str) -> Vec<String> {
+    let recent = recent_list_with(load_recent_files(), path, MAX_RECENT_FILES);
+    save_recent_files(&recent);
+    recent
 }
 
 fn shortcut_config_path() -> Option<PathBuf> {
@@ -385,10 +562,62 @@ fn apply_configured_shortcuts(app: &Application) {
     let shortcuts = load_shortcuts();
 
     for (action, _) in DEFAULT_SHORTCUTS {
-        if let Some(accel) = shortcuts.get(action) {
-            app.set_accels_for_action(action, &[accel.as_str()]);
-        }
+        let Some(accel) = shortcuts.get(action) else {
+            continue;
+        };
+
+        // LEARN: set_accels_for_action takes a *list* — an action can have
+        // several accelerators. The configured binding comes first so it is
+        // the one GTK shows in menus.
+        let mut accels = vec![accel.as_str()];
+        accels.extend(
+            SHORTCUT_ALIASES
+                .iter()
+                .filter(|(alias_action, _)| alias_action == action)
+                .map(|(_, alias_accel)| *alias_accel),
+        );
+
+        app.set_accels_for_action(action, &accels);
     }
+}
+
+// Apply a zoom multiplier to both panes.
+//
+// The preview is easy: WebKit has real zoom that reflows the document. The
+// editor has no zoom API, so we scale its font instead through a CSS provider
+// installed on the display. Sizing in `em` keeps the user's system font size
+// as the baseline rather than hardcoding a point size, and at 100% we clear
+// the CSS entirely so the default appearance is untouched.
+fn apply_zoom(zoom: f64, web_view: &WebView, editor_css: &gtk4::CssProvider) {
+    web_view.set_zoom_level(zoom);
+
+    if (zoom - ZOOM_DEFAULT).abs() < f64::EPSILON {
+        editor_css.load_from_string("");
+    } else {
+        editor_css.load_from_string(&format!("textview {{ font-size: {zoom}em; }}"));
+    }
+}
+
+// Multiply `current` by `factor`, or reset to 100% when `factor` is None.
+// Rounding to two decimals stops repeated multiplication from drifting to
+// values like 0.9999999999999999.
+fn next_zoom(current: f64, factor: Option<f64>) -> f64 {
+    match factor {
+        Some(factor) => ((current * factor * 100.0).round() / 100.0).clamp(ZOOM_MIN, ZOOM_MAX),
+        None => ZOOM_DEFAULT,
+    }
+}
+
+// Compute the next zoom level and apply it to both panes.
+fn adjust_zoom(
+    factor: Option<f64>,
+    zoom: &Rc<std::cell::Cell<f64>>,
+    web_view: &WebView,
+    editor_css: &gtk4::CssProvider,
+) {
+    let next = next_zoom(zoom.get(), factor);
+    zoom.set(next);
+    apply_zoom(next, web_view, editor_css);
 }
 
 fn set_source_style_scheme_for_theme(
@@ -430,6 +659,84 @@ fn render_preview(buffer: &Buffer, web_view: &WebView, theme_mode: ThemeMode) {
     let (start, end) = buffer.bounds();
     let markdown_text = buffer.text(&start, &end, false);
     web_view.load_html(&markdown_to_html(markdown_text.as_str(), theme_mode), None);
+}
+
+// Abbreviate the user's home directory to "~" so long absolute paths stay
+// readable as menu labels while remaining unambiguous across folders.
+fn recent_menu_label(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            if let Some(rest) = path.strip_prefix(home.as_ref()) {
+                return format!("~{rest}");
+            }
+        }
+    }
+    path.to_owned()
+}
+
+// Replace the contents of the "Open Recent" submenu with one entry per path.
+// Each entry targets the parameterized `win.open-recent` action, carrying its
+// path as a string GVariant. An empty list shows a disabled placeholder.
+fn rebuild_recent_menu(recent_menu: &gio::Menu, paths: &[String]) {
+    recent_menu.remove_all();
+
+    if paths.is_empty() {
+        // A menu item with no action renders insensitive (greyed out).
+        recent_menu.append(Some("(No recent files)"), None);
+        return;
+    }
+
+    for path in paths {
+        let item = gio::MenuItem::new(Some(&recent_menu_label(path)), None);
+        item.set_action_and_target_value(Some("win.open-recent"), Some(&path.to_variant()));
+        recent_menu.append_item(&item);
+    }
+}
+
+// Load `path` into the editor: read its contents into the buffer, update the
+// window title and the "currently open file" state, and record it in the recent
+// files list (rebuilding the Open Recent menu to match). Shared by the Open
+// dialog, the Open Recent entries, and the initial file passed on the CLI.
+fn open_path_into_editor(
+    path: &std::path::Path,
+    buffer: &Buffer,
+    window: &adw::ApplicationWindow,
+    current_file: &Rc<RefCell<Option<String>>>,
+    recent_menu: &gio::Menu,
+) {
+    // Store a canonical absolute path so the recent list de-duplicates entries
+    // that were reached via different relative paths.
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    match std::fs::read_to_string(&absolute) {
+        Ok(content) => {
+            buffer.set_text(&content);
+            buffer.set_modified(false);
+            let name = absolute
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            window.set_title(Some(&format!("markdown_smith — {name}")));
+            let stored = absolute.to_string_lossy().into_owned();
+            *current_file.borrow_mut() = Some(stored.clone());
+            let recent = push_recent_file(&stored);
+            rebuild_recent_menu(recent_menu, &recent);
+        }
+        Err(err) => {
+            eprintln!("Open error: {err}");
+            // A recent entry that no longer opens (moved/deleted) is dropped so
+            // it stops cluttering the menu.
+            let stored = absolute.to_string_lossy().into_owned();
+            let mut recent = load_recent_files();
+            let before = recent.len();
+            recent.retain(|existing| existing != &stored);
+            if recent.len() != before {
+                save_recent_files(&recent);
+                rebuild_recent_menu(recent_menu, &recent);
+            }
+        }
+    }
 }
 
 fn write_buffer_to_path(
@@ -674,11 +981,15 @@ fn install_focus_pane_shortcuts(
 // LEARN: gio::Menu (unlike gtk4 widgets) needs no display connection to
 // construct or inspect, which makes the menu structure itself unit-testable
 // — see `tests::menu_bar_has_expected_structure` below.
-fn build_menu_model() -> gio::Menu {
+// Returns the full menu model plus a handle to the (initially empty) "Open
+// Recent" submenu, so the caller can repopulate it as files are opened.
+fn build_menu_model() -> (gio::Menu, gio::Menu) {
     let menu_model = gio::Menu::new();
 
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Open"), Some("win.open"));
+    let recent_menu = gio::Menu::new();
+    file_menu.append_submenu(Some("Open Recent"), &recent_menu);
     file_menu.append(Some("Save"), Some("win.save"));
     file_menu.append(Some("Quit"), Some("win.quit"));
     menu_model.append_submenu(Some("File"), &file_menu);
@@ -695,9 +1006,12 @@ fn build_menu_model() -> gio::Menu {
     view_menu.append(Some("Preview Only"), Some("win.preview-only"));
     view_menu.append(Some("Split View"), Some("win.split-view"));
     view_menu.append(Some("Swap Panes"), Some("win.swap-panes"));
+    view_menu.append(Some("Zoom In"), Some("win.zoom-in"));
+    view_menu.append(Some("Zoom Out"), Some("win.zoom-out"));
+    view_menu.append(Some("Reset Zoom"), Some("win.zoom-reset"));
     menu_model.append_submenu(Some("View"), &view_menu);
 
-    menu_model
+    (menu_model, recent_menu)
 }
 
 // LEARN: GTK4 apps separate "create the Application object" (main) from
@@ -809,7 +1123,8 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     toolbar_view.set_content(Some(&paned));
 
     // ── Menu bar (File | Edit) ──────────────────────────────────────────────
-    let menu_model = build_menu_model();
+    let (menu_model, recent_menu) = build_menu_model();
+    rebuild_recent_menu(&recent_menu, &load_recent_files());
 
     let menu_bar = gtk4::PopoverMenuBar::from_model(Some(&menu_model));
     toolbar_view.add_top_bar(&menu_bar);
@@ -868,36 +1183,53 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
         let buf = source_buffer.clone();
         let win = window.clone();
         let cf = current_file.clone();
+        let recent = recent_menu.clone();
         open_action.connect_activate(move |_, _| {
             let buf = buf.clone();
-            let win = win.clone();
             let cf = cf.clone();
+            let recent = recent.clone();
             // win_cb is moved into the callback; win is only borrowed for the
             // duration of the dialog.open() call itself (to set the parent window).
             let win_cb = win.clone();
             let dialog = gtk4::FileDialog::new();
+            // Open in the folder of the current file so the common case —
+            // reaching for a sibling document — needs no navigation.
+            if let Some(dir) = cf
+                .borrow()
+                .as_ref()
+                .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()))
+            {
+                dialog.set_initial_folder(Some(&gio::File::for_path(&dir)));
+            }
             dialog.open(Some(&win), gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
-                        match std::fs::read_to_string(&path) {
-                            Ok(content) => {
-                                buf.set_text(&content);
-                                buf.set_modified(false);
-                                let name = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown");
-                                win_cb.set_title(Some(&format!("markdown_smith — {name}")));
-                                *cf.borrow_mut() = Some(path.to_string_lossy().into_owned());
-                            }
-                            Err(e) => eprintln!("Open error: {e}"),
-                        }
+                        open_path_into_editor(&path, &buf, &win_cb, &cf, &recent);
                     }
                 }
             });
         });
     }
     window.add_action(&open_action);
+
+    // ── Action: File → Open Recent → <path> ─────────────────────────────────
+    // A single parameterized action serves every entry in the Open Recent
+    // submenu; the target GVariant carries which path to open.
+    let open_recent_action =
+        gio::SimpleAction::new("open-recent", Some(gtk4::glib::VariantTy::STRING));
+    {
+        let buf = source_buffer.clone();
+        let win = window.clone();
+        let cf = current_file.clone();
+        let recent = recent_menu.clone();
+        open_recent_action.connect_activate(move |_, param| {
+            let Some(path) = param.and_then(|value| value.get::<String>()) else {
+                return;
+            };
+            open_path_into_editor(std::path::Path::new(&path), &buf, &win, &cf, &recent);
+        });
+    }
+    window.add_action(&open_recent_action);
 
     // ── Action: File → Save ─────────────────────────────────────────────────
     let save_action = gio::SimpleAction::new("save", None);
@@ -1068,6 +1400,40 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     }
     window.add_action(&swap_panes_action);
 
+    // ── Zoom ────────────────────────────────────────────────────────────────
+
+    // LEARN: Cell<f64> gives interior mutability for a Copy type without the
+    // borrow bookkeeping of RefCell — the zoom level is a single number that
+    // several closures need to read and write.
+    let zoom_level = Rc::new(std::cell::Cell::new(ZOOM_DEFAULT));
+
+    // LEARN: A CssProvider added to the *display* styles every widget in the
+    // app. We keep a handle so each zoom step can rewrite its contents in
+    // place. APPLICATION priority sits above the theme but below user CSS.
+    let editor_css = gtk4::CssProvider::new();
+    if let Some(display) = gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &editor_css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
+    for (action_name, factor) in [
+        ("zoom-in", Some(ZOOM_STEP)),
+        ("zoom-out", Some(1.0 / ZOOM_STEP)),
+        ("zoom-reset", None),
+    ] {
+        let action = gio::SimpleAction::new(action_name, None);
+        let zoom = zoom_level.clone();
+        let preview = web_view.clone();
+        let css = editor_css.clone();
+        action.connect_activate(move |_, _| {
+            adjust_zoom(factor, &zoom, &preview, &css);
+        });
+        window.add_action(&action);
+    }
+
     apply_configured_shortcuts(app);
 
     // ── Signal: buffer changed → re-render preview ──────────────────────────
@@ -1110,6 +1476,16 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
     source_buffer.set_text(&initial_text);
     source_buffer.set_modified(false);
 
+    // A file passed on the command line counts as "recently opened" too.
+    if let Some(path) = file_path {
+        let absolute =
+            std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        if absolute.is_file() {
+            let recent = push_recent_file(&absolute.to_string_lossy());
+            rebuild_recent_menu(&recent_menu, &recent);
+        }
+    }
+
     // ── Show the window ─────────────────────────────────────────────────────
 
     // LEARN: present() makes the window visible and raises it to the front.
@@ -1121,6 +1497,67 @@ fn build_ui(app: &Application, file_path: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_steps_up_and_down_and_returns_to_the_default() {
+        let zoomed_in = next_zoom(ZOOM_DEFAULT, Some(ZOOM_STEP));
+        assert!(zoomed_in > ZOOM_DEFAULT);
+
+        // Stepping back down lands exactly on 1.0 rather than drifting.
+        assert_eq!(next_zoom(zoomed_in, Some(1.0 / ZOOM_STEP)), ZOOM_DEFAULT);
+        assert_eq!(next_zoom(zoomed_in, None), ZOOM_DEFAULT);
+    }
+
+    #[test]
+    fn zoom_is_clamped_to_its_bounds() {
+        assert_eq!(next_zoom(ZOOM_MAX, Some(ZOOM_STEP)), ZOOM_MAX);
+        assert_eq!(next_zoom(ZOOM_MIN, Some(1.0 / ZOOM_STEP)), ZOOM_MIN);
+    }
+
+    #[test]
+    fn shortcut_aliases_only_target_known_actions() {
+        let actions = known_actions();
+        for (action, _) in SHORTCUT_ALIASES {
+            assert!(actions.contains(action), "unknown alias action `{action}`");
+        }
+    }
+
+    #[test]
+    fn renders_mermaid_fences_as_diagram_blocks() {
+        let (body, has_diagram) = render_markdown_body("```mermaid\ngraph TD;\n  A --> B;\n```\n");
+
+        assert!(has_diagram);
+        assert!(body.contains("<pre class=\"mermaid\">"));
+        // The arrow must survive as escaped text, not become markup.
+        assert!(body.contains("A --&gt; B;"));
+        assert!(!body.contains("<code>"));
+    }
+
+    #[test]
+    fn renders_other_fenced_code_blocks_normally() {
+        let (body, has_diagram) = render_markdown_body("```rust\nfn main() {}\n```\n");
+
+        assert!(!has_diagram);
+        assert!(body.contains("<code class=\"language-rust\">"));
+        assert!(!body.contains("class=\"mermaid\""));
+    }
+
+    #[test]
+    fn embeds_mermaid_bundle_only_when_a_diagram_is_present() {
+        let with_diagram =
+            markdown_to_html("```mermaid\ngraph TD;\n  A --> B;\n```", ThemeMode::Light);
+        let without_diagram = markdown_to_html("# Just a heading", ThemeMode::Light);
+
+        assert!(with_diagram.contains("mermaid.initialize"));
+        assert!(!without_diagram.contains("mermaid.initialize"));
+    }
+
+    #[test]
+    fn selects_mermaid_theme_matching_the_app_theme() {
+        let dark = markdown_to_html("```mermaid\ngraph TD;\n  A --> B;\n```", ThemeMode::Dark);
+
+        assert!(dark.contains(r#"theme: "dark""#));
+    }
 
     fn known_actions() -> HashSet<&'static str> {
         DEFAULT_SHORTCUTS
@@ -1229,8 +1666,46 @@ mod tests {
     }
 
     #[test]
+    fn recent_list_moves_repeat_to_front_without_duplicating() {
+        let existing = vec!["/a.md".to_string(), "/b.md".to_string()];
+        assert_eq!(
+            recent_list_with(existing, "/b.md", 10),
+            vec!["/b.md".to_string(), "/a.md".to_string()],
+        );
+    }
+
+    #[test]
+    fn recent_list_prepends_new_entries() {
+        let existing = vec!["/a.md".to_string()];
+        assert_eq!(
+            recent_list_with(existing, "/b.md", 10),
+            vec!["/b.md".to_string(), "/a.md".to_string()],
+        );
+    }
+
+    #[test]
+    fn recent_list_caps_at_max_length() {
+        let existing = vec!["/1".to_string(), "/2".to_string(), "/3".to_string()];
+        assert_eq!(
+            recent_list_with(existing, "/new", 2),
+            vec!["/new".to_string(), "/1".to_string()],
+        );
+    }
+
+    #[test]
+    fn recent_menu_label_abbreviates_home_directory() {
+        // recent_menu_label reads $HOME; drive it with a known value.
+        std::env::set_var("HOME", "/home/tester");
+        assert_eq!(
+            recent_menu_label("/home/tester/docs/notes.md"),
+            "~/docs/notes.md"
+        );
+        assert_eq!(recent_menu_label("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
     fn menu_bar_has_expected_structure() {
-        let structure = menu_structure(&build_menu_model());
+        let structure = menu_structure(&build_menu_model().0);
 
         assert_eq!(
             structure,
@@ -1239,6 +1714,8 @@ mod tests {
                     "File".to_string(),
                     vec![
                         ("Open".to_string(), "win.open".to_string()),
+                        // "Open Recent" is a submenu, so it carries no action.
+                        ("Open Recent".to_string(), String::new()),
                         ("Save".to_string(), "win.save".to_string()),
                         ("Quit".to_string(), "win.quit".to_string()),
                     ]
@@ -1259,6 +1736,9 @@ mod tests {
                         ("Preview Only".to_string(), "win.preview-only".to_string()),
                         ("Split View".to_string(), "win.split-view".to_string()),
                         ("Swap Panes".to_string(), "win.swap-panes".to_string()),
+                        ("Zoom In".to_string(), "win.zoom-in".to_string()),
+                        ("Zoom Out".to_string(), "win.zoom-out".to_string()),
+                        ("Reset Zoom".to_string(), "win.zoom-reset".to_string()),
                     ]
                 ),
             ]
